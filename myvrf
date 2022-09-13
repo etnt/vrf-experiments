@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+trap cleanup SIGINT SIGTERM ERR EXIT
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd -P)
+
+fix_rules() {
+  # fix ip rule setup.
+  [[ ${dry_run} -eq 1 ]] && echo "sudo ./fix-vrf-rules.sh"
+  [[ ${dry_run} -eq 0 ]] && sudo ./fix-vrf-rules.sh
+  [[ ${dry_run} -eq 1 ]] && echo "ip rule list"
+  [[ ${dry_run} -eq 0 ]] && ip rule list
+  return 0
+}
+
+
+usage() {
+  cat << EOF # remove the space between << and EOF, this is due to web plugin issue
+Usage: $(basename "${BASH_SOURCE[0]}") [-h] [-v] [-f] -p param_value arg1 [arg2...]
+
+Script description here.
+
+Available options:
+
+-h, --help      Print this help and exit
+-v, --verbose   Print script debug info
+-f, --flag      Some flag description
+-p, --param     Some param description
+EOF
+  exit
+}
+
+dry_run=0
+vrf_name="vrf-0"
+vrf_ip="192.168.200.1"
+vrf_nw="192.168.200.0"
+extra_cable="xcable"
+extra_cable_vrf="192.168.99.1"
+extra_cable_ip="192.168.99.2"
+extra_cable_nw="192.168.99.0"
+
+cleanup() {
+  trap - SIGINT SIGTERM ERR EXIT
+  # script cleanup here
+  [[ ${dry_run} -eq 0 ]] && ( cleanup_cables || true )
+  [[ ${dry_run} -eq 0 ]] && ( cleanup_vrf || true )
+  [[ ${dry_run} -eq 0 ]] && ( cleanup_namespaces || true )
+  return 0
+}
+
+setup_namespaces() {
+  [[ ! -f "${netns_config-vrf.conf}" ]] && die "Missing required vrf config csv file"
+  while IFS="," read -r namespace ipnw
+    do
+      [[ ${dry_run} -eq 1 ]] && echo "sudo ip netns add ${namespace}"
+      [[ ${dry_run} -eq 0 ]] && sudo ip netns add ${namespace}
+    done < ${netns_config-vrf.conf}
+  return 0
+}
+
+cleanup_namespaces() {
+  [[ ! -f "${netns_config-vrf.conf}" ]] && die "Missing required netns config csv file"
+  while IFS="," read -r namespace ipnw
+    do
+      sudo ip netns del ${namespace}
+    done < ${netns_config-vrf.conf}
+  return 0
+}
+
+setup_vrf() {
+  [[ ${dry_run} -eq 1 ]] && echo "sudo ip link add ${vrf_name} type vrf table 10"
+  [[ ${dry_run} -eq 0 ]] && sudo ip link add ${vrf_name} type vrf table 10
+  [[ ${dry_run} -eq 1 ]] && echo "sudo ip link set dev ${vrf_name} up"
+  [[ ${dry_run} -eq 0 ]] && sudo ip link set dev ${vrf_name} up
+  # Set the default route for the table (and hence default route for the VRF)
+  #[[ ${dry_run} -eq 1 ]] && echo "sudo ip route add table 10 unreachable default metric 4278198272"
+  #[[ ${dry_run} -eq 0 ]] && sudo ip route add table 10 unreachable default metric 4278198272
+  return 0
+}
+
+cleanup_vrf() {
+  #[[ ${dry_run} -eq 1 ]] && echo "sudo ip route del table 10 unreachable default metric 4278198272"
+  #[[ ${dry_run} -eq 0 ]] && sudo ip route del table 10 unreachable default metric 4278198272
+  sudo ip link del ${vrf_name}
+  return 0
+}
+
+setup_cables() {
+  [[ ! -f "${netns_config-vrf.conf}" ]] && die "Missing required netns config csv file"
+  while IFS="," read -r namespace ipnw
+    do
+      [[ ${dry_run} -eq 1 ]] && echo "sudo ip link add veth-${namespace} type veth peer name veth-${namespace}-vrf"
+      [[ ${dry_run} -eq 0 ]] && sudo ip link add "veth-${namespace}" type veth peer name "veth-${namespace}-vrf"
+    done < ${netns_config-vrf.conf}
+
+  # Create the extra cable
+  [[ ${dry_run} -eq 1 ]] && echo "sudo ip link add ${extra_cable} type veth peer name ${extra_cable}-vrf"
+  [[ ${dry_run} -eq 0 ]] && sudo ip link add "${extra_cable}" type veth peer name "${extra_cable}-vrf"
+
+  return 0
+}
+
+cleanup_cables() {
+  [[ ! -f "${netns_config-vrf.conf}" ]] && die "Missing required netns config csv file"
+  while IFS="," read -r namespace ipnw
+    do
+      sudo ip -n east link del "veth-${namespace}"
+    done < ${netns_config-vrf.conf}
+
+  # Remove the extra cable
+  sudo ip link del "${extra_cable}"
+  return 0
+}
+
+connect_cables() {
+  [[ ! -f "${netns_config-vrf.conf}" ]] && die "Missing required netns config csv file"
+  while IFS="," read -r namespace ipnw
+    do
+      [[ ${dry_run} -eq 1 ]] && echo "sudo ip link set veth-${namespace} netns ${namespace}"
+      [[ ${dry_run} -eq 0 ]] && sudo ip link set "veth-${namespace}" netns ${namespace}
+      [[ ${dry_run} -eq 1 ]] && echo "sudo ip link set veth-${namespace}-vrf master ${vrf_name}"
+      [[ ${dry_run} -eq 0 ]] && sudo ip link set "veth-${namespace}-vrf" master ${vrf_name}
+    done < ${netns_config-vrf.conf}
+
+  # Connect the extra cable to the VRF
+  [[ ${dry_run} -eq 1 ]] && echo "sudo ip link set ${extra_cable}-vrf master ${vrf_name}"
+  [[ ${dry_run} -eq 0 ]] && sudo ip link set "${extra_cable}-vrf" master ${vrf_name}
+
+  return 0
+}
+
+# <<< is known as here-string. Instead of typing in text,
+# you give a pre-made string of text to a program. For example,
+# with such program as bc we can do bc <<< 5*4 to just get
+# output for that specific case, no need to run bc interactively.
+# Think of it as the equivalent of echo '5*4' | bc.
+
+set_ip() {
+  [[ ! -f "${netns_config-vrf.conf}" ]] && die "Missing required netns config csv file"
+  while IFS="," read -r namespace ipnw
+    do
+
+      read A B C D <<<"${ipnw//./ }"
+      ip_netns="${A}.${B}.${C}.2"
+      ip_vrf="${A}.${B}.${C}.1"
+
+      # Setup IP on device (cable end) inside the NetNS
+      [[ ${dry_run} -eq 1 ]] && echo "sudo ip -n ${namespace} addr add ${ip_netns}/24 dev veth-${namespace}"
+      [[ ${dry_run} -eq 0 ]] && sudo ip -n ${namespace} addr add "${ip_netns}/24" dev "veth-${namespace}"
+      [[ ${dry_run} -eq 1 ]] && echo "sudo ip -n ${namespace} link set veth-${namespace} up"
+      [[ ${dry_run} -eq 0 ]] && sudo ip -n ${namespace} link set "veth-${namespace}" up
+
+      # Setup IP on device (cable end) inside the VRF
+      [[ ${dry_run} -eq 1 ]] && echo "sudo ip addr add ${ip_vrf}/24 dev veth-${namespace}-vrf"
+      [[ ${dry_run} -eq 0 ]] && sudo ip addr add "${ip_vrf}/24" dev "veth-${namespace}-vrf"
+      [[ ${dry_run} -eq 1 ]] && echo "sudo ip link set veth-${namespace}-vrf up"
+      [[ ${dry_run} -eq 0 ]] && sudo ip link set "veth-${namespace}-vrf" up
+
+      # Setup default route from the NetNs to the VRF
+      [[ ${dry_run} -eq 1 ]] && echo "sudo ip -n ${namespace} route add default via ${ip_vrf}"
+      [[ ${dry_run} -eq 0 ]] && sudo ip -n ${namespace} route add default via ${ip_vrf}
+
+      # Setup the VRF routing to the NetNS
+      #[[ ${dry_run} -eq 1 ]] && echo "sudo ip route add table 10 ${ipnw}/24 dev veth-${namespace}-vrf"
+      #[[ ${dry_run} -eq 0 ]] && sudo ip route add table 10 ${ipnw}/24 dev veth-${namespace}-vrf
+
+      # Setup routing to NetNs from Host via VRF
+      [[ ${dry_run} -eq 1 ]] && echo "sudo ip route add ${ipnw}/24 dev vrf-0"
+      [[ ${dry_run} -eq 0 ]] && sudo ip route add ${ipnw}/24 dev vrf-0
+
+
+    done < ${netns_config-vrf.conf}
+
+
+    # Setup IP for the extra cable (outside the NetNS)
+    [[ ${dry_run} -eq 1 ]] && echo "sudo ip addr add ${extra_cable_ip}/24 dev ${extra_cable}"
+    [[ ${dry_run} -eq 0 ]] && sudo ip addr add "${extra_cable_ip}/24" dev ${extra_cable}
+    [[ ${dry_run} -eq 1 ]] && echo "sudo ip link set ${extra_cable} up"
+    [[ ${dry_run} -eq 0 ]] && sudo ip link set "${extra_cable}" up
+
+    # Setup IP for the extra cable (inside the NetNS)
+    [[ ${dry_run} -eq 1 ]] && echo "sudo ip addr add ${extra_cable_vrf}/24 dev ${extra_cable}-vrf"
+    [[ ${dry_run} -eq 0 ]] && sudo ip addr add "${extra_cable_vrf}/24" dev ${extra_cable}-vrf
+    [[ ${dry_run} -eq 1 ]] && echo "sudo ip link set ${extra_cable}-vrf up"
+    [[ ${dry_run} -eq 0 ]] && sudo ip link set "${extra_cable}-vrf" up
+
+    # Setup the routing to the extra cable
+    #[[ ${dry_run} -eq 1 ]] && echo "sudo ip route add table 10 ${extra_cable_nw}/24 dev ${extra_cable}-vrf"
+    #[[ ${dry_run} -eq 0 ]] && sudo ip route add table 10 ${extra_cable_nw}/24 dev ${extra_cable}-vrf
+
+    # Remove any direct routing through our xcable
+    #[[ ${dry_run} -eq 1 ]] && echo "sudo ip route del 192.168.15.0/24 dev xcable"
+    #[[ ${dry_run} -eq 0 ]] && ( sudo ip route del 192.168.15.0/24 dev xcable || true )
+
+    # Setup routing to the extra cable from Host via VRF
+    #[[ ${dry_run} -eq 1 ]] && echo "sudo ip route add ${extra_cable_nw}/24 dev vrf-0"
+    #[[ ${dry_run} -eq 0 ]] && sudo ip route add ${extra_cable_nw}/24 dev vrf-0
+
+
+  return 0
+}
+
+msg() {
+  echo >&2 -e "${1-}"
+}
+
+die() {
+  local msg=$1
+  local code=${2-1} # default exit status 1
+  msg "$msg"
+  exit "$code"
+}
+
+bye() {
+  # We don't want to invoke 'cleanup' when doing exit!
+  trap - SIGINT SIGTERM ERR EXIT
+  local msg=$1
+  local code=${2-0} # default exit status 0
+  msg "$msg"
+  exit "$code"
+}
+
+show() {
+  while IFS="," read -r namespace ipaddr
+    do
+      [[ ${dry_run} -eq 0 ]] && echo "# sudo ip -n ${namespace} a ls"
+      [[ ${dry_run} -eq 1 ]] && echo "sudo ip -n ${namespace} a ls"
+      [[ ${dry_run} -eq 0 ]] && ( sudo ip -n ${namespace} a ls || true )
+      echo ""
+      [[ ${dry_run} -eq 0 ]] && echo "# sudo ip netns exec ${namespace} ip route show"
+      [[ ${dry_run} -eq 1 ]] && echo "sudo ip netns exec ${namespace} ip route show"
+      [[ ${dry_run} -eq 0 ]] && sudo ip netns exec ${namespace} ip route show
+      echo ""
+    done < ${netns_config-vrf.conf}
+  [[ ${dry_run} -eq 0 ]] && echo "# ip a ls"
+  [[ ${dry_run} -eq 1 ]] && echo "ip a ls"
+  [[ ${dry_run} -eq 0 ]] && ip a ls
+  echo ""
+  [[ ${dry_run} -eq 0 ]] && echo "# ip -d link show type vrf"
+  [[ ${dry_run} -eq 1 ]] && echo "ip -d link show type vrf"
+  [[ ${dry_run} -eq 0 ]] && ip -d link show type vrf
+  echo ""
+  [[ ${dry_run} -eq 0 ]] && echo "# ip route show vrf ${vrf_name}"
+  [[ ${dry_run} -eq 1 ]] && echo "ip route show vrf ${vrf_name}"
+  [[ ${dry_run} -eq 0 ]] && ip route show vrf ${vrf_name}
+  echo ""
+  [[ ${dry_run} -eq 0 ]] && echo "# ip link show vrf ${vrf_name}"
+  [[ ${dry_run} -eq 1 ]] && echo "ip link show vrf ${vrf_name}"
+  [[ ${dry_run} -eq 0 ]] && ip link show vrf ${vrf_name}
+  echo ""
+  [[ ${dry_run} -eq 0 ]] && echo "# netstat -rn"
+  [[ ${dry_run} -eq 1 ]] && echo "netstat -rn"
+  [[ ${dry_run} -eq 0 ]] && netstat -rn
+  return 0
+}
+
+parse_params() {
+  # default values of variables set from params
+  flag=0
+  param=''
+
+  while :; do
+    case "${1-}" in
+    -h | --help) usage; bye "";;
+    --show) show; bye "" ;;
+    --cleanup) cleanup; bye "Cleaned up!" ;;
+    --cleanup-netns) cleanup_namespaces; bye "Cleaned up!" ;;
+    --cleanup-vrf) cleanup_vrf; bye "Cleaned up!" ;;
+    --cleanup-cables) cleanup_cables; bye "Cleaned up!" ;;
+    --dry-run) dry_run=1 ;;
+    -v | --verbose) set -x ;;
+    -p | --param) # example named parameter
+      param="${2-}"
+      shift
+      ;;
+    -?*) bye "Unknown option: $1" ;;
+    *) break ;;
+    esac
+    shift
+  done
+
+  args=("$@")
+
+  return 0
+}
+
+parse_params "$@"
+
+fix_rules
+setup_namespaces
+setup_vrf
+setup_cables
+connect_cables
+set_ip
+
+trap - SIGINT SIGTERM ERR EXIT
+exit 0
