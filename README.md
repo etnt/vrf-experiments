@@ -12,6 +12,10 @@ Devices are created in pairs. Packets transmitted on one device
 in the pair are immediately received on the other device,
 hence we can think of them as a virtual Ethernet cable.
 
+First, make sure to have IP forwarding enabled:
+
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+
 As an example, the content of the `netns.conf` file can look like:
 
     east,192.168.15.0
