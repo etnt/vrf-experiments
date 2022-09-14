@@ -15,6 +15,9 @@ hence we can think of them as a virtual Ethernet cable.
 First, make sure to have IP forwarding enabled:
 
     echo 1 > /proc/sys/net/ipv4/ip_forward
+    
+NOTE: If the setup from the `myvrf` script should fail the test case,
+try the `unshare-setup.sh` script as an alternative.
 
 As an example, the content of the `netns.conf` file can look like:
 
